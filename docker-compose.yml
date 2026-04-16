@@ -1,0 +1,115 @@
+# =============================================================================
+# dso_system Docker Compose 構成ファイル
+#
+# 使い方:
+#   1. cp .env.example .env  (.envを編集して秘匿情報を設定)
+#   2. docker compose --profile server --profile worker up -d   # 全サービス起動
+#      docker compose --profile worker up -d                    # Worker のみ起動
+#      docker compose --profile server up -d                    # Server + DB のみ起動
+#   3. http://localhost:4200 で Prefect UI にアクセス
+#
+# Profiles:
+#   server  ... Prefect Server + PostgreSQL (管理サーバー用 PC)
+#   worker  ... Worker コンテナ (各実行用 PC)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1. データベース (PostgreSQL)
+  # ---------------------------------------------------------------------------
+  database:
+    image: postgres:16
+    restart: unless-stopped
+    profiles: ["server"]
+    ports:
+      - "5432:5432" # データベースポート
+    environment:
+      - POSTGRES_USER=dso_system
+      - POSTGRES_PASSWORD=dso_system
+      - POSTGRES_DB=dso_system
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - dso_system-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dso_system -d dso_system"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 2. 管理サーバー (Prefect Server)
+  # ---------------------------------------------------------------------------
+  server:
+    image: prefecthq/prefect:3-latest
+    restart: unless-stopped
+    profiles: ["server"]
+    command: prefect server start
+    ports:
+      - "4200:4200"
+    environment:
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://dso_system:dso_system@database:5432/dso_system
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+      - PREFECT_UI_API_URL=http://${ORCHESTRATOR_IP:-localhost}:4200/api
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - dso_system-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # 3. 実行ワーカー
+  #    - アプリコードは環境変数に依存しない (Convention over Configuration)
+  #    - Crawler は ./output にローカル書き込みして完了
+  #    - 転送・通知は Prefect Flow 側の責務
+  # ---------------------------------------------------------------------------
+  worker:
+    build: .
+    restart: unless-stopped
+    profiles: ["worker"]
+    command: >
+      bash -c "
+        echo 'Prefect Server への接続を待機中...';
+        until python -c \"import urllib.request; urllib.request.urlopen('$${PREFECT_API_URL}/health')\" 2>/dev/null; do
+          echo '...サーバー未応答。5秒後にリトライ...';
+          sleep 5;
+        done;
+        echo '...サーバー接続成功!';
+        POOL_NAME=$$([ \"$${dso_system_ENV}\" = 'prod' ] && echo 'scraping-pool' || echo 'dev-pool');
+        echo \"Work Pool: $${POOL_NAME}\";
+        python bin/init_db.py && prefect worker start --pool \"$${POOL_NAME}\" --type process --name $${WORKER_NAME:-worker}-$$(hostname | head -c 6) --limit $${WORKER_LIMIT:-1}
+      "
+    volumes:
+      - ./src:/app/src
+      - ./bin:/app/bin
+      - ./scripts:/app/scripts
+      - ./output:/app/output
+      - ./logs:/app/logs
+    environment:
+      - PREFECT_API_URL=http://${ORCHESTRATOR_IP:-server}:4200/api
+      - dso_system_ENV=${dso_system_ENV:-dev}
+      - dso_system_DB_URL=postgresql://dso_system:dso_system@${ORCHESTRATOR_IP:-database}:5432/dso_system
+      - TZ=Asia/Tokyo
+      - WORKER_NAME=${WORKER_NAME:-worker}
+      - WORKER_LIMIT=${WORKER_LIMIT:-1}
+      - TEAMS_WEBHOOK_URL=${TEAMS_WEBHOOK_URL:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-ap-northeast-1}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME:-}
+    networks:
+      - dso_system-net
+
+volumes:
+  db_data:
+
+networks:
+  dso_system-net:
+    driver: bridge
